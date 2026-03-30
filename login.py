@@ -5,7 +5,8 @@ import aiohttp
 from datetime import datetime
 from playwright.async_api import async_playwright
 
-LOGIN_URL = "https://wispbyte.com/client/servers"
+BASE_URL = "https://wispbyte.com"
+LOGIN_URL = f"{BASE_URL}/client/servers"
 
 async def tg_notify(message: str):
     token = os.getenv("TG_BOT_TOKEN")
@@ -50,29 +51,34 @@ async def tg_notify_photo(photo_path: str, caption: str = ""):
                 pass
 
 def build_report(results, start_time, end_time):
-    success = [r for r in results if r["success"]]
-    failed  = [r for r in results if not r["success"]]
+    online   = [r for r in results if r.get("status") == "already_online"]
+    restarted= [r for r in results if r.get("status") == "restarted"]
+    failed   = [r for r in results if r.get("status") == "failed"]
 
     lines = [
-        "Wispbyte 自动登录报告",
-        f"目标: <a href='https://wispbyte.com/client'>控制面板</a>",
+        "🖥 Wispbyte 服务器状态报告",
         f"时间: {start_time} → {end_time}",
-        f"结果: <b>{len(success)} 成功</b> | <b>{len(failed)} 失败</b>",
+        f"账号总数: {len(results)}",
         ""
     ]
 
-    if success:
-        lines.append("✅ 成功账号：")
-        lines.extend([f"• <code>{r['email']}</code>" for r in success])
+    if online:
+        lines.append("✅ 原本在线（无需操作）：")
+        lines.extend([f"• <code>{r['email']}</code>  服务器 <code>{r['server_id']}</code>" for r in online])
+        lines.append("")
+
+    if restarted:
+        lines.append("🔄 已离线，已执行启动：")
+        lines.extend([f"• <code>{r['email']}</code>  服务器 <code>{r['server_id']}</code>" for r in restarted])
         lines.append("")
 
     if failed:
-        lines.append("❌ 失败账号：")
-        lines.extend([f"• <code>{r['email']}</code>" for r in failed])
+        lines.append("❌ 失败：")
+        lines.extend([f"• <code>{r['email']}</code>  服务器 <code>{r['server_id']}</code>  原因: {r.get('reason','未知')}" for r in failed])
 
     return "\n".join(lines)
 
-async def login_one(email: str, password: str):
+async def check_and_restart(email: str, password: str, server_id: str):
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True, args=[
             "--no-sandbox", "--disable-setuid-sandbox",
@@ -80,59 +86,137 @@ async def login_one(email: str, password: str):
             "--disable-extensions", "--window-size=1920,1080",
             "--disable-blink-features=AutomationControlled"
         ])
-        context = await browser.new_context(viewport={"width": 1920, "height": 1080},
-                                            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36")
+        context = await browser.new_context(
+            viewport={"width": 1920, "height": 1080},
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36"
+        )
         page = await context.new_page()
         page.set_default_timeout(90000)
 
-        result = {"email": email, "success": False}
+        result = {"email": email, "server_id": server_id, "status": "failed", "reason": ""}
         max_retries = 2
 
         for attempt in range(max_retries + 1):
             try:
+                # ── 1. 登录 ──
                 print(f"[{email}] 尝试 {attempt + 1}: 打开登录页...")
                 await page.goto(LOGIN_URL, wait_until="load", timeout=90000)
                 await page.wait_for_load_state("domcontentloaded", timeout=30000)
                 await asyncio.sleep(5)
 
-                if "client" in page.url and "login" not in page.url.lower():
-                    print(f"[{email}] 已登录！")
-                    result["success"] = True
+                if "login" in page.url.lower():
+                    await page.wait_for_selector(
+                        'input[placeholder*="Email"], input[placeholder*="Username"], input[type="email"]',
+                        timeout=20000
+                    )
+                    await page.fill(
+                        'input[placeholder*="Email"], input[placeholder*="Username"], input[type="email"]',
+                        email
+                    )
+                    await page.fill('input[placeholder*="Password"], input[type="password"]', password)
+
+                    try:
+                        await page.wait_for_selector('text=确认您是真人', timeout=8000)
+                        await page.click('text=确认您是真人')
+                        await asyncio.sleep(3)
+                    except:
+                        pass
+
+                    await page.click('button:has-text("Log In")')
+                    await page.wait_for_url("**/client**", timeout=30000)
+
+                print(f"[{email}] 登录成功，进入服务器 Console 页...")
+
+                # ── 2. 进入 Console 页 ──
+                console_url = f"{BASE_URL}/client/servers/{server_id}/console"
+                await page.goto(console_url, wait_until="load", timeout=60000)
+                await page.wait_for_load_state("domcontentloaded", timeout=30000)
+                await asyncio.sleep(5)
+
+                # ── 3. 读取服务器状态 ──
+                # Pterodactyl 状态标签通常是带 "Online"/"Offline" 文字的 span
+                status_el = await page.query_selector(
+                    'span:has-text("Online"), span:has-text("Offline"), '
+                    'span:has-text("Starting"), span:has-text("Stopping")'
+                )
+                if not status_el:
+                    raise Exception("找不到服务器状态标签，页面可能未加载完成")
+
+                status_text = (await status_el.inner_text()).strip()
+                print(f"[{email}] 服务器 {server_id} 当前状态: {status_text}")
+
+                if status_text.lower() == "online":
+                    print(f"[{email}] 服务器在线，无需操作")
+                    result["status"] = "already_online"
                     break
 
-                await page.wait_for_selector(
-                    'input[placeholder*="Email"], input[placeholder*="Username"], input[type="email"], input[type="text"]',
-                    timeout=20000
+                # ── 4. 服务器离线，点击 Start（第1个图标按钮 ▶）──
+                print(f"[{email}] 服务器 {status_text}，执行启动...")
+
+                # Pterodactyl 的控制按钮区域，Start 是第一个 button
+                # 通常包裹在 class 含 "power" 或直接是 svg 图标 button
+                start_btn = await page.query_selector(
+                    'button[aria-label="Start"], '
+                    'button[title="Start"], '
+                    'button svg[data-icon="play"]'
                 )
-                await page.fill('input[placeholder*="Email"], input[placeholder*="Username"], input[type="email"], input[type="text"]', email)
-                await page.fill('input[placeholder*="Password"], input[type="password"]', password)
 
+                if not start_btn:
+                    # 降级方案：找所有图标按钮，取第一个（▶ Start）
+                    btns = await page.query_selector_all(
+                        'div.console-actions button, '
+                        'div[class*="power"] button, '
+                        'div[class*="control"] button'
+                    )
+                    if btns:
+                        start_btn = btns[0]
+
+                if not start_btn:
+                    raise Exception("找不到 Start 按钮")
+
+                await start_btn.click()
+                print(f"[{email}] 已点击 Start，等待服务器启动（最多60秒）...")
+
+                # ── 5. 等待状态变为 Online ──
                 try:
-                    await page.wait_for_selector('text=确认您是真人, input[type="checkbox"]', timeout=10000)
-                    await page.click('text=确认您是真人')
-                    await asyncio.sleep(3)
+                    await page.wait_for_selector(
+                        'span:has-text("Online")',
+                        timeout=60000
+                    )
+                    print(f"[{email}] 服务器已成功启动！")
+                    result["status"] = "restarted"
                 except:
-                    pass
-
-                await page.click('button:has-text("Log In")')
-                await page.wait_for_url("**/client**", timeout=30000)
-                result["success"] = True
-                break
-
-            except Exception as e:
-                if attempt < max_retries:
-                    await context.close()
-                    context = await browser.new_context(viewport={"width": 1920, "height": 1080},
-                                                        user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36")
-                    page = await context.new_page()
-                    await asyncio.sleep(2)
-                else:
-                    screenshot = f"error_{email.replace('@', '_')}_{int(datetime.now().timestamp())}.png"
+                    # 超时但不报错，截图留证
+                    screenshot = f"warn_{email.replace('@','_')}_{int(datetime.now().timestamp())}.png"
                     await page.screenshot(path=screenshot, full_page=True)
                     await tg_notify_photo(
                         screenshot,
-                        caption=f"Wispbyte 登录失败\n账号: <code>{email}</code>\n错误: <i>{str(e)[:200]}</i>\nURL: {page.url}"
+                        caption=f"⚠️ Wispbyte 启动超时\n账号: <code>{email}</code>\n服务器: <code>{server_id}</code>\n点击了 Start 但60秒内未变为 Online"
                     )
+                    result["status"] = "restarted"  # 已执行操作，结果待观察
+                    result["reason"] = "启动超时，已点击 Start"
+                break
+
+            except Exception as e:
+                print(f"[{email}] 第 {attempt+1} 次失败: {e}")
+                result["reason"] = str(e)[:200]
+                if attempt < max_retries:
+                    await context.close()
+                    context = await browser.new_context(
+                        viewport={"width": 1920, "height": 1080},
+                        user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36"
+                    )
+                    page = await context.new_page()
+                    page.set_default_timeout(90000)
+                    await asyncio.sleep(3)
+                else:
+                    screenshot = f"error_{email.replace('@','_')}_{int(datetime.now().timestamp())}.png"
+                    await page.screenshot(path=screenshot, full_page=True)
+                    await tg_notify_photo(
+                        screenshot,
+                        caption=f"❌ Wispbyte 操作失败\n账号: <code>{email}</code>\n服务器: <code>{server_id}</code>\n错误: <i>{str(e)[:200]}</i>"
+                    )
+
         await context.close()
         await browser.close()
         return result
@@ -141,25 +225,34 @@ async def main():
     start_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     accounts_str = os.getenv("LOGIN_ACCOUNTS")
     if not accounts_str:
-        await tg_notify("Failed: 未配置任何账号")
+        await tg_notify("❌ Failed: 未配置任何账号")
         return
 
-    accounts = [a.strip() for a in accounts_str.split(",") if ":" in a]
+    # 格式：email:password:server_id,email2:password2:server_id2
+    accounts = []
+    for a in accounts_str.split(","):
+        a = a.strip()
+        parts = a.split(":", 2)
+        if len(parts) == 3:
+            accounts.append(tuple(parts))
+        else:
+            print(f"Warning: 跳过格式错误的账号配置: {a}（应为 email:password:server_id）")
+
     if not accounts:
-        await tg_notify("Failed: LOGIN_ACCOUNTS 格式错误，应为 email:password")
+        await tg_notify("❌ Failed: LOGIN_ACCOUNTS 格式错误，应为 email:password:server_id")
         return
 
-    tasks = [login_one(email, pwd) for email, pwd in (acc.split(":", 1) for acc in accounts)]
+    tasks = [check_and_restart(email, pwd, sid) for email, pwd, sid in accounts]
     results = await asyncio.gather(*tasks)
 
     end_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    final_msg = build_report(results, start_time, end_time)
+    final_msg = build_report(list(results), start_time, end_time)
     await tg_notify(final_msg)
     print(final_msg)
 
 if __name__ == "__main__":
     accounts = os.getenv('LOGIN_ACCOUNTS', '').strip()
-    count = len([a for a in accounts.split(',') if ':' in a]) if accounts else 0
-    print(f"[{datetime.now()}] login.py 开始运行", file=sys.stderr)
+    count = len([a for a in accounts.split(',') if a.count(':') >= 2]) if accounts else 0
+    print(f"[{datetime.now()}] wispbyte.py 开始运行", file=sys.stderr)
     print(f"Python: {sys.version.split()[0]}, 有效账号数: {count}", file=sys.stderr)
     asyncio.run(main())
