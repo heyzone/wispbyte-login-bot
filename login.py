@@ -6,7 +6,7 @@ from datetime import datetime
 from playwright.async_api import async_playwright
 
 BASE_URL = "https://wispbyte.com"
-LOGIN_URL = f"{BASE_URL}/auth/login"
+LOGIN_URL = f"{BASE_URL}/client/servers"
 
 async def tg_notify(message: str):
     token = os.getenv("TG_BOT_TOKEN")
