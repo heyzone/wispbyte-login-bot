@@ -51,9 +51,9 @@ async def tg_notify_photo(photo_path: str, caption: str = ""):
                 pass
 
 def build_report(results, start_time, end_time):
-    online   = [r for r in results if r.get("status") == "already_online"]
-    restarted= [r for r in results if r.get("status") == "restarted"]
-    failed   = [r for r in results if r.get("status") == "failed"]
+    online    = [r for r in results if r.get("status") == "already_online"]
+    restarted = [r for r in results if r.get("status") == "restarted"]
+    failed    = [r for r in results if r.get("status") == "failed"]
 
     lines = [
         "🖥 Wispbyte 服务器状态报告",
@@ -74,7 +74,7 @@ def build_report(results, start_time, end_time):
 
     if failed:
         lines.append("❌ 失败：")
-        lines.extend([f"• <code>{r['email']}</code>  服务器 <code>{r['server_id']}</code>  原因: {r.get('reason','未知')}" for r in failed])
+        lines.extend([f"• <code>{r['email']}</code>  服务器 <code>{r['server_id']}</code>  原因: {r.get('reason', '未知')}" for r in failed])
 
     return "\n".join(lines)
 
@@ -133,15 +133,8 @@ async def check_and_restart(email: str, password: str, server_id: str):
                 await page.wait_for_load_state("domcontentloaded", timeout=30000)
                 await asyncio.sleep(5)
 
-                # ── 3. 读取服务器状态 ──
-                # Pterodactyl 状态标签通常是带 "Online"/"Offline" 文字的 span
-                status_el = await page.query_selector(
-                    'span:has-text("Online"), span:has-text("Offline"), '
-                    'span:has-text("Starting"), span:has-text("Stopping")'
-                )
-                if not status_el:
-                    raise Exception("找不到服务器状态标签，页面可能未加载完成")
-
+                # ── 3. 读取服务器状态（ID: online-status-text）──
+                status_el = await page.wait_for_selector('#online-status-text', timeout=20000)
                 status_text = (await status_el.inner_text()).strip()
                 print(f"[{email}] 服务器 {server_id} 当前状态: {status_text}")
 
@@ -150,55 +143,33 @@ async def check_and_restart(email: str, password: str, server_id: str):
                     result["status"] = "already_online"
                     break
 
-                # ── 4. 服务器离线，点击 Start（第1个图标按钮 ▶）──
-                print(f"[{email}] 服务器 {status_text}，执行启动...")
-
-                # Pterodactyl 的控制按钮区域，Start 是第一个 button
-                # 通常包裹在 class 含 "power" 或直接是 svg 图标 button
-                start_btn = await page.query_selector(
-                    'button[aria-label="Start"], '
-                    'button[title="Start"], '
-                    'button svg[data-icon="play"]'
-                )
-
-                if not start_btn:
-                    # 降级方案：找所有图标按钮，取第一个（▶ Start）
-                    btns = await page.query_selector_all(
-                        'div.console-actions button, '
-                        'div[class*="power"] button, '
-                        'div[class*="control"] button'
-                    )
-                    if btns:
-                        start_btn = btns[0]
-
-                if not start_btn:
-                    raise Exception("找不到 Start 按钮")
-
+                # ── 4. 服务器离线，点击 Start 按钮（ID: start-btn）──
+                print(f"[{email}] 服务器状态为 [{status_text}]，执行启动...")
+                start_btn = await page.wait_for_selector('#start-btn', timeout=10000)
                 await start_btn.click()
                 print(f"[{email}] 已点击 Start，等待服务器启动（最多60秒）...")
 
-                # ── 5. 等待状态变为 Online ──
+                # ── 5. 等待 online-status-text 变为 "Online" ──
                 try:
-                    await page.wait_for_selector(
-                        'span:has-text("Online")',
+                    await page.wait_for_function(
+                        'document.getElementById("online-status-text")?.textContent?.trim() === "Online"',
                         timeout=60000
                     )
                     print(f"[{email}] 服务器已成功启动！")
                     result["status"] = "restarted"
                 except:
-                    # 超时但不报错，截图留证
-                    screenshot = f"warn_{email.replace('@','_')}_{int(datetime.now().timestamp())}.png"
+                    screenshot = f"warn_{email.replace('@', '_')}_{int(datetime.now().timestamp())}.png"
                     await page.screenshot(path=screenshot, full_page=True)
                     await tg_notify_photo(
                         screenshot,
-                        caption=f"⚠️ Wispbyte 启动超时\n账号: <code>{email}</code>\n服务器: <code>{server_id}</code>\n点击了 Start 但60秒内未变为 Online"
+                        caption=f"⚠️ Wispbyte 启动超时\n账号: <code>{email}</code>\n服务器: <code>{server_id}</code>\n已点击 Start 但60秒内未变为 Online"
                     )
-                    result["status"] = "restarted"  # 已执行操作，结果待观察
-                    result["reason"] = "启动超时，已点击 Start"
+                    result["status"] = "restarted"
+                    result["reason"] = "启动超时，已点击 Start，结果待观察"
                 break
 
             except Exception as e:
-                print(f"[{email}] 第 {attempt+1} 次失败: {e}")
+                print(f"[{email}] 第 {attempt + 1} 次失败: {e}")
                 result["reason"] = str(e)[:200]
                 if attempt < max_retries:
                     await context.close()
@@ -210,7 +181,7 @@ async def check_and_restart(email: str, password: str, server_id: str):
                     page.set_default_timeout(90000)
                     await asyncio.sleep(3)
                 else:
-                    screenshot = f"error_{email.replace('@','_')}_{int(datetime.now().timestamp())}.png"
+                    screenshot = f"error_{email.replace('@', '_')}_{int(datetime.now().timestamp())}.png"
                     await page.screenshot(path=screenshot, full_page=True)
                     await tg_notify_photo(
                         screenshot,
