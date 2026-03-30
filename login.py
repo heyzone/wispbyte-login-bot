@@ -5,8 +5,7 @@ import aiohttp
 from datetime import datetime
 from playwright.async_api import async_playwright
 
-BASE_URL = "https://wispbyte.com"
-LOGIN_URL = f"{BASE_URL}/client/servers"
+LOGIN_URL = "https://wispbyte.com/client/servers"
 
 async def tg_notify(message: str):
     token = os.getenv("TG_BOT_TOKEN")
@@ -51,31 +50,34 @@ async def tg_notify_photo(photo_path: str, caption: str = ""):
                 pass
 
 def build_report(results, start_time, end_time):
-    online    = [r for r in results if r.get("status") == "already_online"]
-    restarted = [r for r in results if r.get("status") == "restarted"]
-    failed    = [r for r in results if r.get("status") == "failed"]
+    online    = [r for r in results if r.get("server_status") == "already_online"]
+    restarted = [r for r in results if r.get("server_status") == "restarted"]
+    failed    = [r for r in results if not r["success"]]
 
     lines = [
         "🖥 Wispbyte 服务器状态报告",
+        f"目标: <a href='https://wispbyte.com/client'>控制面板</a>",
         f"时间: {start_time} → {end_time}",
-        f"账号总数: {len(results)}",
         ""
     ]
+
     if online:
-        lines.append("✅ 原本在线（无需操作）：")
-        lines.extend([f"• <code>{r['email']}</code>  服务器 <code>{r['server_id']}</code>" for r in online])
+        lines.append("✅ 服务器在线（无需操作）：")
+        lines.extend([f"• <code>{r['email']}</code>" for r in online])
         lines.append("")
+
     if restarted:
         lines.append("🔄 已离线，已执行启动：")
-        lines.extend([f"• <code>{r['email']}</code>  服务器 <code>{r['server_id']}</code>" for r in restarted])
+        lines.extend([f"• <code>{r['email']}</code>" for r in restarted])
         lines.append("")
+
     if failed:
-        lines.append("❌ 失败：")
-        lines.extend([f"• <code>{r['email']}</code>  服务器 <code>{r['server_id']}</code>  原因: {r.get('reason', '未知')}" for r in failed])
+        lines.append("❌ 失败账号：")
+        lines.extend([f"• <code>{r['email']}</code>" for r in failed])
 
     return "\n".join(lines)
 
-async def check_and_restart(email: str, password: str, server_id: str):
+async def login_one(email: str, password: str, server_id: str):
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True, args=[
             "--no-sandbox", "--disable-setuid-sandbox",
@@ -90,73 +92,57 @@ async def check_and_restart(email: str, password: str, server_id: str):
         page = await context.new_page()
         page.set_default_timeout(90000)
 
-        result = {"email": email, "server_id": server_id, "status": "failed", "reason": ""}
+        result = {"email": email, "success": False, "server_status": None}
         max_retries = 2
 
         for attempt in range(max_retries + 1):
             try:
-                # ── 1. 打开登录页 ──
+                # ── 原始登录逻辑（完全不变）──
                 print(f"[{email}] 尝试 {attempt + 1}: 打开登录页...")
                 await page.goto(LOGIN_URL, wait_until="load", timeout=90000)
                 await page.wait_for_load_state("domcontentloaded", timeout=30000)
-                await asyncio.sleep(3)
+                await asyncio.sleep(5)
 
-                # ── 2. 确认登录表单存在 ──
-                email_input = await page.query_selector(
-                    'input[placeholder*="Email"], input[placeholder*="Username"], input[type="email"]'
-                )
-                if not email_input:
-                    raise Exception("找不到登录表单，页面可能未正常加载")
-
-                await email_input.fill(email)
-                await page.fill('input[placeholder*="Password"], input[type="password"]', password)
-                print(f"[{email}] 已填写账号密码，等待 Turnstile 验证...")
-
-                # ── 3. 等待 Cloudflare Turnstile 自动完成 ──
-                try:
-                    await page.wait_for_function(
-                        '''() => {
-                            const token = document.querySelector('input[name="cf-turnstile-response"]');
-                            return token && token.value && token.value.length > 0;
-                        }''',
-                        timeout=30000
+                if "client" in page.url and "login" not in page.url.lower():
+                    print(f"[{email}] 已登录！")
+                    result["success"] = True
+                else:
+                    await page.wait_for_selector(
+                        'input[placeholder*="Email"], input[placeholder*="Username"], input[type="email"], input[type="text"]',
+                        timeout=20000
                     )
-                    print(f"[{email}] Turnstile 验证通过")
-                except:
-                    print(f"[{email}] Turnstile 等待超时，尝试直接点击登录...")
+                    await page.fill('input[placeholder*="Email"], input[placeholder*="Username"], input[type="email"], input[type="text"]', email)
+                    await page.fill('input[placeholder*="Password"], input[type="password"]', password)
 
-                # ── 4. 点击登录按钮 ──
-                await page.click('button:has-text("Log In")')
-                print(f"[{email}] 已点击登录，等待跳转...")
+                    try:
+                        await page.wait_for_selector('text=确认您是真人, input[type="checkbox"]', timeout=10000)
+                        await page.click('text=确认您是真人')
+                        await asyncio.sleep(3)
+                    except:
+                        pass
 
-                # ── 5. 等待跳转到 client 页面 ──
-                await page.wait_for_url("**/client**", timeout=30000)
-                await page.wait_for_load_state("domcontentloaded", timeout=20000)
-                await asyncio.sleep(3)
-                print(f"[{email}] 登录成功！当前页面: {page.url}")
+                    await page.click('button:has-text("Log In")')
+                    await page.wait_for_url("**/client**", timeout=30000)
+                    result["success"] = True
+                    print(f"[{email}] 登录成功！")
 
-                # ── 6. 等待服务器列表加载，点击 MANAGE SERVER ──
+                # ── 新增：登录成功后点击 MANAGE SERVER ──
                 print(f"[{email}] 等待服务器列表加载...")
                 await page.wait_for_load_state("networkidle", timeout=20000)
                 await asyncio.sleep(2)
 
-                # 优先：找含 server_id 标签附近的 MANAGE SERVER 按钮（多服务器安全）
+                # 优先找含 server_id 卡片内的按钮，找不到降级直接找文字
                 manage_btn = None
                 try:
-                    # 找显示 #server_id 的元素，向上找祖先容器，再找按钮
-                    manage_btn = await page.query_selector(
-                        f'text=#{server_id}'
-                    )
-                    if manage_btn:
-                        # 在同一个卡片容器内找 MANAGE SERVER 按钮
-                        card = await manage_btn.evaluate_handle(
-                            'el => el.closest("div[class*=\'server\'], div[class*=\'card\'], section, article, li") || el.parentElement.parentElement.parentElement'
+                    id_el = await page.query_selector(f'text=#{server_id}')
+                    if id_el:
+                        card = await id_el.evaluate_handle(
+                            'el => el.closest("div, section, article, li") || el.parentElement'
                         )
                         manage_btn = await card.query_selector('text=MANAGE SERVER')
                 except:
                     manage_btn = None
 
-                # 降级：直接找页面上的 MANAGE SERVER（单服务器账号足够）
                 if not manage_btn:
                     manage_btn = await page.query_selector('text=MANAGE SERVER')
 
@@ -168,45 +154,40 @@ async def check_and_restart(email: str, password: str, server_id: str):
                 await asyncio.sleep(3)
                 print(f"[{email}] 已进入 Console 页，当前: {page.url}")
 
-                # ── 7. 读取服务器状态 ──
-                print(f"[{email}] 等待状态元素加载...")
+                # ── 新增：读取服务器状态 ──
                 status_el = await page.wait_for_selector('#online-status-text', timeout=20000)
                 status_text = (await status_el.inner_text()).strip()
-                print(f"[{email}] 服务器 {server_id} 当前状态: {status_text}")
+                print(f"[{email}] 服务器状态: {status_text}")
 
                 if status_text.lower() == "online":
                     print(f"[{email}] 服务器在线，无需操作")
-                    result["status"] = "already_online"
+                    result["server_status"] = "already_online"
                     break
 
-                # ── 8. 服务器离线，点击 Start ──
-                print(f"[{email}] 服务器状态为 [{status_text}]，执行启动...")
+                # ── 新增：离线则点击 Start ──
+                print(f"[{email}] 服务器 [{status_text}]，执行启动...")
                 start_btn = await page.wait_for_selector('#start-btn', timeout=10000)
                 await start_btn.click()
-                print(f"[{email}] 已点击 Start，等待服务器启动（最多60秒）...")
+                print(f"[{email}] 已点击 Start，等待启动（最多60秒）...")
 
-                # ── 9. 等待状态变为 Online ──
                 try:
                     await page.wait_for_function(
                         'document.getElementById("online-status-text")?.textContent?.trim() === "Online"',
                         timeout=60000
                     )
-                    print(f"[{email}] 服务器已成功启动！")
-                    result["status"] = "restarted"
+                    print(f"[{email}] 服务器启动成功！")
+                    result["server_status"] = "restarted"
                 except:
                     screenshot = f"warn_{email.replace('@', '_')}_{int(datetime.now().timestamp())}.png"
                     await page.screenshot(path=screenshot, full_page=True)
                     await tg_notify_photo(
                         screenshot,
-                        caption=f"⚠️ Wispbyte 启动超时\n账号: <code>{email}</code>\n服务器: <code>{server_id}</code>\n已点击 Start 但60秒内未变为 Online"
+                        caption=f"⚠️ Wispbyte 启动超时\n账号: <code>{email}</code>\n已点击 Start 但60秒内未变为 Online"
                     )
-                    result["status"] = "restarted"
-                    result["reason"] = "启动超时，已点击 Start，结果待观察"
+                    result["server_status"] = "restarted"
                 break
 
             except Exception as e:
-                print(f"[{email}] 第 {attempt + 1} 次失败: {e}")
-                result["reason"] = str(e)[:200]
                 if attempt < max_retries:
                     await context.close()
                     context = await browser.new_context(
@@ -214,14 +195,13 @@ async def check_and_restart(email: str, password: str, server_id: str):
                         user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36"
                     )
                     page = await context.new_page()
-                    page.set_default_timeout(90000)
-                    await asyncio.sleep(3)
+                    await asyncio.sleep(2)
                 else:
                     screenshot = f"error_{email.replace('@', '_')}_{int(datetime.now().timestamp())}.png"
                     await page.screenshot(path=screenshot, full_page=True)
                     await tg_notify_photo(
                         screenshot,
-                        caption=f"❌ Wispbyte 操作失败\n账号: <code>{email}</code>\n服务器: <code>{server_id}</code>\n错误: <i>{str(e)[:200]}</i>"
+                        caption=f"❌ Wispbyte 操作失败\n账号: <code>{email}</code>\n错误: <i>{str(e)[:200]}</i>\nURL: {page.url}"
                     )
 
         await context.close()
@@ -235,7 +215,7 @@ async def main():
         await tg_notify("❌ Failed: 未配置任何账号")
         return
 
-    # 格式：email:password:server_id,email2:password2:server_id2
+    # 格式：email:password:server_id
     accounts = []
     for a in accounts_str.split(","):
         a = a.strip()
@@ -249,17 +229,17 @@ async def main():
         await tg_notify("❌ Failed: LOGIN_ACCOUNTS 格式错误，应为 email:password:server_id")
         return
 
-    tasks = [check_and_restart(email, pwd, sid) for email, pwd, sid in accounts]
+    tasks = [login_one(email, pwd, sid) for email, pwd, sid in accounts]
     results = await asyncio.gather(*tasks)
 
     end_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    final_msg = build_report(list(results), start_time, end_time)
+    final_msg = build_report(results, start_time, end_time)
     await tg_notify(final_msg)
     print(final_msg)
 
 if __name__ == "__main__":
     accounts = os.getenv('LOGIN_ACCOUNTS', '').strip()
     count = len([a for a in accounts.split(',') if a.count(':') >= 2]) if accounts else 0
-    print(f"[{datetime.now()}] wispbyte.py 开始运行", file=sys.stderr)
+    print(f"[{datetime.now()}] login.py 开始运行", file=sys.stderr)
     print(f"Python: {sys.version.split()[0]}, 有效账号数: {count}", file=sys.stderr)
     asyncio.run(main())
