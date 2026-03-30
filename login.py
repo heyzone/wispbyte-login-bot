@@ -74,7 +74,7 @@ def build_report(results, start_time, end_time):
 
     return "\n".join(lines)
 
-async def login_one(email: str, password: str, server_id: str):
+async def login_one(email: str, password: str):
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True, args=[
             "--no-sandbox", "--disable-setuid-sandbox",
@@ -127,50 +127,15 @@ async def login_one(email: str, password: str, server_id: str):
                 print(f"[{email}] 当前页面: {page.url}，等待列表加载...")
                 await asyncio.sleep(3)
 
-                # 打印页面上所有按钮文字，方便调试
-                btns = await page.query_selector_all('button, a')
-                btn_texts = []
-                for b in btns[:20]:  # 只取前20个避免太多
-                    t = (await b.inner_text()).strip()
-                    if t:
-                        btn_texts.append(t)
-                print(f"[{email}] 页面可见按钮/链接（前20）: {btn_texts}")
-
                 # ── 新增：点击 MANAGE SERVER ──
-                manage_btn = None
-
-                # 方法1：找含 server_id 的元素附近的按钮
-                try:
-                    id_el = await page.query_selector(f'text=#{server_id}')
-                    if id_el:
-                        print(f"[{email}] 找到 #{server_id} 标签，尝试找附近的 MANAGE SERVER...")
-                        card = await id_el.evaluate_handle(
-                            'el => el.closest("div, section, article, li") || el.parentElement'
-                        )
-                        manage_btn = await card.query_selector('text=MANAGE SERVER')
-                        if manage_btn:
-                            print(f"[{email}] 方法1：通过 server_id 找到 MANAGE SERVER 按钮")
-                    else:
-                        print(f"[{email}] 未找到 #{server_id} 标签")
-                except Exception as e1:
-                    print(f"[{email}] 方法1 异常: {e1}")
-
-                # 方法2：直接找页面上的 MANAGE SERVER 文字
-                if not manage_btn:
-                    try:
-                        manage_btn = await page.query_selector('text=MANAGE SERVER')
-                        if manage_btn:
-                            print(f"[{email}] 方法2：直接找到 MANAGE SERVER 按钮")
-                        else:
-                            print(f"[{email}] 方法2：未找到 MANAGE SERVER 按钮")
-                    except Exception as e2:
-                        print(f"[{email}] 方法2 异常: {e2}")
-
-                if not manage_btn:
-                    # 截图留证
+                manage_btn = await page.query_selector('text=MANAGE SERVER')
+                if manage_btn:
+                    print(f"[{email}] 找到 MANAGE SERVER 按钮，点击进入...")
+                else:
+                    # 截图调试
                     screenshot = f"debug_{email.replace('@','_')}_{int(datetime.now().timestamp())}.png"
                     await page.screenshot(path=screenshot, full_page=True)
-                    await tg_notify_photo(screenshot, caption=f"🔍 调试截图\n账号: <code>{email}</code>\n找不到 MANAGE SERVER 按钮\nURL: {page.url}")
+                    await tg_notify_photo(screenshot, caption=f"🔍 调试截图\n账号: <code>{email}</code>\n找不到 MANAGE SERVER\nURL: {page.url}")
                     raise Exception(f"找不到 MANAGE SERVER 按钮，当前URL: {page.url}")
 
                 await manage_btn.click()
@@ -242,19 +207,12 @@ async def main():
         await tg_notify("❌ Failed: 未配置任何账号")
         return
 
-    # LOGIN_ACCOUNTS 格式：email:password（保持原始格式不变）
-    # SERVER_ID 单独用环境变量传入
-    server_id = os.getenv("SERVER_ID", "").strip()
-    if not server_id:
-        await tg_notify("❌ Failed: 未配置 SERVER_ID")
-        return
-
     accounts = [a.strip() for a in accounts_str.split(",") if ":" in a]
     if not accounts:
         await tg_notify("❌ Failed: LOGIN_ACCOUNTS 格式错误，应为 email:password")
         return
 
-    tasks = [login_one(email, pwd, server_id) for email, pwd in (acc.split(":", 1) for acc in accounts)]
+    tasks = [login_one(email, pwd) for email, pwd in (acc.split(":", 1) for acc in accounts)]
     results = await asyncio.gather(*tasks)
 
     end_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
