@@ -6,7 +6,7 @@ from datetime import datetime
 from playwright.async_api import async_playwright
 
 BASE_URL = "https://wispbyte.com"
-LOGIN_URL = f"{BASE_URL}/client/servers"
+LOGIN_URL = f"{BASE_URL}/auth/login"
 
 async def tg_notify(message: str):
     token = os.getenv("TG_BOT_TOKEN")
@@ -61,17 +61,14 @@ def build_report(results, start_time, end_time):
         f"账号总数: {len(results)}",
         ""
     ]
-
     if online:
         lines.append("✅ 原本在线（无需操作）：")
         lines.extend([f"• <code>{r['email']}</code>  服务器 <code>{r['server_id']}</code>" for r in online])
         lines.append("")
-
     if restarted:
         lines.append("🔄 已离线，已执行启动：")
         lines.extend([f"• <code>{r['email']}</code>  服务器 <code>{r['server_id']}</code>" for r in restarted])
         lines.append("")
-
     if failed:
         lines.append("❌ 失败：")
         lines.extend([f"• <code>{r['email']}</code>  服务器 <code>{r['server_id']}</code>  原因: {r.get('reason', '未知')}" for r in failed])
@@ -98,42 +95,81 @@ async def check_and_restart(email: str, password: str, server_id: str):
 
         for attempt in range(max_retries + 1):
             try:
-                # ── 1. 登录 ──
+                # ── 1. 打开登录页 ──
                 print(f"[{email}] 尝试 {attempt + 1}: 打开登录页...")
                 await page.goto(LOGIN_URL, wait_until="load", timeout=90000)
                 await page.wait_for_load_state("domcontentloaded", timeout=30000)
-                await asyncio.sleep(5)
+                await asyncio.sleep(3)
 
-                if "login" in page.url.lower():
-                    await page.wait_for_selector(
-                        'input[placeholder*="Email"], input[placeholder*="Username"], input[type="email"]',
-                        timeout=20000
+                # ── 2. 确认登录表单存在 ──
+                email_input = await page.query_selector(
+                    'input[placeholder*="Email"], input[placeholder*="Username"], input[type="email"]'
+                )
+                if not email_input:
+                    raise Exception("找不到登录表单，页面可能未正常加载")
+
+                await email_input.fill(email)
+                await page.fill('input[placeholder*="Password"], input[type="password"]', password)
+                print(f"[{email}] 已填写账号密码，等待 Turnstile 验证...")
+
+                # ── 3. 等待 Cloudflare Turnstile 自动完成 ──
+                try:
+                    await page.wait_for_function(
+                        '''() => {
+                            const token = document.querySelector('input[name="cf-turnstile-response"]');
+                            return token && token.value && token.value.length > 0;
+                        }''',
+                        timeout=30000
                     )
-                    await page.fill(
-                        'input[placeholder*="Email"], input[placeholder*="Username"], input[type="email"]',
-                        email
+                    print(f"[{email}] Turnstile 验证通过")
+                except:
+                    print(f"[{email}] Turnstile 等待超时，尝试直接点击登录...")
+
+                # ── 4. 点击登录按钮 ──
+                await page.click('button:has-text("Log In")')
+                print(f"[{email}] 已点击登录，等待跳转...")
+
+                # ── 5. 等待跳转到 client 页面 ──
+                await page.wait_for_url("**/client**", timeout=30000)
+                await page.wait_for_load_state("domcontentloaded", timeout=20000)
+                await asyncio.sleep(3)
+                print(f"[{email}] 登录成功！当前页面: {page.url}")
+
+                # ── 6. 等待服务器列表加载，点击 MANAGE SERVER ──
+                print(f"[{email}] 等待服务器列表加载...")
+                await page.wait_for_load_state("networkidle", timeout=20000)
+                await asyncio.sleep(2)
+
+                # 优先：找含 server_id 标签附近的 MANAGE SERVER 按钮（多服务器安全）
+                manage_btn = None
+                try:
+                    # 找显示 #server_id 的元素，向上找祖先容器，再找按钮
+                    manage_btn = await page.query_selector(
+                        f'text=#{server_id}'
                     )
-                    await page.fill('input[placeholder*="Password"], input[type="password"]', password)
+                    if manage_btn:
+                        # 在同一个卡片容器内找 MANAGE SERVER 按钮
+                        card = await manage_btn.evaluate_handle(
+                            'el => el.closest("div[class*=\'server\'], div[class*=\'card\'], section, article, li") || el.parentElement.parentElement.parentElement'
+                        )
+                        manage_btn = await card.query_selector('text=MANAGE SERVER')
+                except:
+                    manage_btn = None
 
-                    try:
-                        await page.wait_for_selector('text=确认您是真人', timeout=8000)
-                        await page.click('text=确认您是真人')
-                        await asyncio.sleep(3)
-                    except:
-                        pass
+                # 降级：直接找页面上的 MANAGE SERVER（单服务器账号足够）
+                if not manage_btn:
+                    manage_btn = await page.query_selector('text=MANAGE SERVER')
 
-                    await page.click('button:has-text("Log In")')
-                    await page.wait_for_url("**/client**", timeout=30000)
+                if not manage_btn:
+                    raise Exception("找不到 MANAGE SERVER 按钮，服务器列表可能未加载")
 
-                print(f"[{email}] 登录成功，进入服务器 Console 页...")
-
-                # ── 2. 进入 Console 页 ──
-                console_url = f"{BASE_URL}/client/servers/{server_id}/console"
-                await page.goto(console_url, wait_until="load", timeout=60000)
+                await manage_btn.click()
                 await page.wait_for_load_state("domcontentloaded", timeout=30000)
-                await asyncio.sleep(5)
+                await asyncio.sleep(3)
+                print(f"[{email}] 已进入 Console 页，当前: {page.url}")
 
-                # ── 3. 读取服务器状态（ID: online-status-text）──
+                # ── 7. 读取服务器状态 ──
+                print(f"[{email}] 等待状态元素加载...")
                 status_el = await page.wait_for_selector('#online-status-text', timeout=20000)
                 status_text = (await status_el.inner_text()).strip()
                 print(f"[{email}] 服务器 {server_id} 当前状态: {status_text}")
@@ -143,13 +179,13 @@ async def check_and_restart(email: str, password: str, server_id: str):
                     result["status"] = "already_online"
                     break
 
-                # ── 4. 服务器离线，点击 Start 按钮（ID: start-btn）──
+                # ── 8. 服务器离线，点击 Start ──
                 print(f"[{email}] 服务器状态为 [{status_text}]，执行启动...")
                 start_btn = await page.wait_for_selector('#start-btn', timeout=10000)
                 await start_btn.click()
                 print(f"[{email}] 已点击 Start，等待服务器启动（最多60秒）...")
 
-                # ── 5. 等待 online-status-text 变为 "Online" ──
+                # ── 9. 等待状态变为 Online ──
                 try:
                     await page.wait_for_function(
                         'document.getElementById("online-status-text")?.textContent?.trim() === "Online"',
@@ -207,7 +243,7 @@ async def main():
         if len(parts) == 3:
             accounts.append(tuple(parts))
         else:
-            print(f"Warning: 跳过格式错误的账号配置: {a}（应为 email:password:server_id）")
+            print(f"Warning: 跳过格式错误配置: {a}（应为 email:password:server_id）")
 
     if not accounts:
         await tg_notify("❌ Failed: LOGIN_ACCOUNTS 格式错误，应为 email:password:server_id")
