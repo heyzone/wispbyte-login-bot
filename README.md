@@ -2,6 +2,8 @@
 
 每 **3 天**自动登录 wispbyte 服务器，防止掉线。
 
+增加git token，自动回传cookie，改为用cookie登录更加稳健！
+
 ## 配置步骤
 
 1. **创建 Telegram Bot**
