@@ -94,57 +94,97 @@ async def login_one(email: str, password: str):
 
         for attempt in range(max_retries + 1):
             try:
-                # ── 原始登录逻辑（完全不变）──
                 print(f"[{email}] 尝试 {attempt + 1}: 打开登录页...")
                 await page.goto(LOGIN_URL, wait_until="load", timeout=90000)
                 await page.wait_for_load_state("domcontentloaded", timeout=30000)
                 await asyncio.sleep(5)
 
-                if "client" in page.url and "login" not in page.url.lower():
-                    print(f"[{email}] 已登录！当前URL: {page.url}")
+                # ── 真正判断是否已登录：检查页面有没有服务器内容 ──
+                manage_el = await page.query_selector('text=MANAGE SERVER')
+                already_logged_in = manage_el is not None
+
+                if already_logged_in:
+                    print(f"[{email}] 确认已登录，页面有服务器内容")
                     result["success"] = True
                 else:
+                    # ── 需要登录，先确认登录表单存在 ──
+                    print(f"[{email}] 未检测到登录态，开始登录流程...")
                     await page.wait_for_selector(
-                        'input[placeholder*="Email"], input[placeholder*="Username"], input[type="email"], input[type="text"]',
+                        'input[placeholder*="Email"], input[placeholder*="Username"], input[type="email"]',
                         timeout=20000
                     )
-                    await page.fill('input[placeholder*="Email"], input[placeholder*="Username"], input[type="email"], input[type="text"]', email)
+                    await page.fill(
+                        'input[placeholder*="Email"], input[placeholder*="Username"], input[type="email"]',
+                        email
+                    )
                     await page.fill('input[placeholder*="Password"], input[type="password"]', password)
+                    print(f"[{email}] 已填写账号密码")
 
-                    try:
-                        await page.wait_for_selector('text=确认您是真人, input[type="checkbox"]', timeout=10000)
-                        await page.click('text=确认您是真人')
-                        await asyncio.sleep(3)
-                    except:
-                        pass
+                    # ── 加强版 Turnstile 处理 ──
+                    # Turnstile 是自动验证的，我们只需等待它完成
+                    # 完成标志：cf-turnstile-response input 有值，或者直接等固定时间
+                    print(f"[{email}] 等待 Cloudflare Turnstile 自动完成...")
+                    turnstile_done = False
+                    for _ in range(15):  # 最多等15秒
+                        await asyncio.sleep(1)
+                        try:
+                            token_val = await page.evaluate(
+                                '''() => {
+                                    const t = document.querySelector('input[name="cf-turnstile-response"]');
+                                    return t ? t.value : "";
+                                }'''
+                            )
+                            if token_val and len(token_val) > 10:
+                                print(f"[{email}] Turnstile 验证完成（token已生成）")
+                                turnstile_done = True
+                                break
+                        except:
+                            pass
 
+                    if not turnstile_done:
+                        # 尝试点击 Turnstile iframe 内的 checkbox
+                        print(f"[{email}] Turnstile token未生成，尝试点击checkbox...")
+                        try:
+                            # 找到 Turnstile iframe
+                            frames = page.frames
+                            for frame in frames:
+                                if "challenges.cloudflare.com" in frame.url:
+                                    cb = await frame.query_selector('input[type="checkbox"]')
+                                    if cb:
+                                        await cb.click()
+                                        print(f"[{email}] 已点击 Turnstile checkbox")
+                                        await asyncio.sleep(3)
+                                        break
+                        except Exception as te:
+                            print(f"[{email}] 点击 Turnstile 失败: {te}")
+
+                    # ── 点击登录按钮 ──
                     await page.click('button:has-text("Log In")')
+                    print(f"[{email}] 已点击登录，等待跳转...")
+
+                    # 等待跳转到已登录页面，且页面有 MANAGE SERVER
                     await page.wait_for_url("**/client**", timeout=30000)
-                    result["success"] = True
-                    print(f"[{email}] 登录成功！当前URL: {page.url}")
+                    await page.wait_for_load_state("domcontentloaded", timeout=20000)
+                    await asyncio.sleep(5)
 
-                # ── 新增：等待列表页完全加载 ──
-                print(f"[{email}] 当前页面: {page.url}，等待列表加载...")
-                await asyncio.sleep(3)
+                    # 再次确认真正登录成功
+                    manage_check = await page.query_selector('text=MANAGE SERVER')
+                    if manage_check:
+                        print(f"[{email}] ✅ 登录成功，页面有服务器内容！URL: {page.url}")
+                        result["success"] = True
+                        manage_el = manage_check
+                    else:
+                        raise Exception(f"登录后页面无服务器内容，可能Turnstile未通过，URL: {page.url}")
 
-                # ── 新增：点击 MANAGE SERVER ──
-                manage_btn = await page.query_selector('text=MANAGE SERVER')
-                if manage_btn:
-                    print(f"[{email}] 找到 MANAGE SERVER 按钮，点击进入...")
-                else:
-                    # 截图调试
-                    screenshot = f"debug_{email.replace('@','_')}_{int(datetime.now().timestamp())}.png"
-                    await page.screenshot(path=screenshot, full_page=True)
-                    await tg_notify_photo(screenshot, caption=f"🔍 调试截图\n账号: <code>{email}</code>\n找不到 MANAGE SERVER\nURL: {page.url}")
-                    raise Exception(f"找不到 MANAGE SERVER 按钮，当前URL: {page.url}")
-
-                await manage_btn.click()
+                # ── 点击 MANAGE SERVER ──
+                print(f"[{email}] 点击 MANAGE SERVER 进入 Console...")
+                await manage_el.click()
                 await page.wait_for_load_state("domcontentloaded", timeout=30000)
                 await asyncio.sleep(3)
-                print(f"[{email}] ✅ 已进入 Console 页，当前URL: {page.url}")
+                print(f"[{email}] ✅ 已进入 Console 页，URL: {page.url}")
 
-                # ── 新增：读取服务器状态 ──
-                print(f"[{email}] 等待 #online-status-text 加载...")
+                # ── 读取服务器状态 ──
+                print(f"[{email}] 等待状态元素加载...")
                 status_el = await page.wait_for_selector('#online-status-text', timeout=20000)
                 status_text = (await status_el.inner_text()).strip()
                 print(f"[{email}] 服务器状态: [{status_text}]")
@@ -154,7 +194,7 @@ async def login_one(email: str, password: str):
                     result["server_status"] = "already_online"
                     break
 
-                # ── 新增：离线则点击 Start ──
+                # ── 离线则点击 Start ──
                 print(f"[{email}] 服务器离线，执行启动...")
                 start_btn = await page.wait_for_selector('#start-btn', timeout=10000)
                 await start_btn.click()
@@ -187,6 +227,7 @@ async def login_one(email: str, password: str):
                         user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36"
                     )
                     page = await context.new_page()
+                    page.set_default_timeout(90000)
                     await asyncio.sleep(2)
                 else:
                     screenshot = f"error_{email.replace('@','_')}_{int(datetime.now().timestamp())}.png"
