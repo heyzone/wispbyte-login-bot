@@ -3,7 +3,7 @@ name: Wispbyte Smart Auto-Sync
 on:
   schedule:
     # 每3天在 UTC 21:31 运行一次（北京时间凌晨 5:31）
-    - cron: '31 21 */3 * *'
+    - cron: '31 21 * * *'
   workflow_dispatch: # 允许手动点击运行进行测试
 
 jobs:
