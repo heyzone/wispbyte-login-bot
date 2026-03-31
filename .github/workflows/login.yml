@@ -19,7 +19,7 @@ jobs:
         with:
           to: ${{ secrets.TG_CHAT_ID }}
           token: ${{ secrets.TG_BOT_TOKEN }}
-          message: "*Wispbyte 任务已启动！*\n预计 8–12 分钟完成\n查看: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          message: "*Wispbyte 任务已启动！*\n环境：真实 Chrome + Xvfb\n预计 8–12 分钟完成"
           format: markdown
 
       - name: Set up Python
@@ -27,29 +27,34 @@ jobs:
         with:
           python-version: '3.11'
 
+      - name: Install System Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xvfb  # 安装虚拟显示器支持
+
       - name: Install Python dependencies
         timeout-minutes: 8
         run: |
-          echo "开始安装依赖（预计 3–6 分钟）"
-          set -e
+          echo "开始安装依赖..."
           pip install --quiet playwright aiohttp
-          playwright install chromium --with-deps
+          # 安装真实的 Google Chrome 浏览器及其依赖
+          playwright install chrome --with-deps
           echo "依赖安装完成"
 
       - name: Run login script
-        timeout-minutes: 6
+        timeout-minutes: 10
         env:
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
           LOGIN_ACCOUNTS: ${{ secrets.LOGIN_ACCOUNTS }}
         run: |
-          echo "开始执行 login.py（最多 5 分钟）"
-          timeout 5m python login.py && echo "login.py 成功完成" || echo "脚本执行失败或被超时中断"
-          echo "本 step 结束"
+          echo "开始执行 login.py（使用 Xvfb 模拟显示器）"
+          # 使用 xvfb-run 包装执行，-a 自动寻找可用显示端口
+          xvfb-run -a python login.py && echo "login.py 成功完成" || echo "脚本执行失败"
 
   notify-failure:
     needs: login
-    if: needs.login.result == 'cancelled' || needs.login.result == 'failure'
+    if: always() && (needs.login.result == 'cancelled' || needs.login.result == 'failure')
     runs-on: ubuntu-latest
     steps:
       - name: Send Telegram Alert
@@ -57,5 +62,5 @@ jobs:
         with:
           to: ${{ secrets.TG_CHAT_ID }}
           token: ${{ secrets.TG_BOT_TOKEN }}
-          message: "*GitHub Actions 异常*\n\n状态：`${{ needs.login.result }}`\n${{ needs.login.result == 'cancelled' && '超时自动取消' || '脚本执行失败' }}\n\n查看日志：\nhttps://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}\n\n发 `/retry` 手动重试"
+          message: "*GitHub Actions 异常*\n\n状态：`${{ needs.login.result }}`\n查看日志：\nhttps://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
           format: markdown
