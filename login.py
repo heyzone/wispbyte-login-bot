@@ -9,15 +9,14 @@ from nacl import encoding, public
 
 # --- 配置区 ---
 BASE_URL = "https://wispbyte.com"
-# 从环境变量读取 Secret
 ACCOUNTS_STR = os.getenv("LOGIN_ACCOUNTS", "")
 GH_PAT = os.getenv("GH_PAT")
 GH_REPO = os.getenv("GITHUB_REPOSITORY")
 
 async def update_github_secret(new_value):
-    """使用 PyNaCl 加密并回写 GitHub Secret"""
+    """使用 PyNaCl 加密并全自动回写 GitHub Secret"""
     if not GH_PAT or not GH_REPO:
-        print("❌ 缺少 GH_PAT 或 GITHUB_REPOSITORY 环境变量，无法更新 Secret")
+        print("❌ 缺少 GH_PAT 或 GITHUB_REPOSITORY 环境变量")
         return False
 
     headers = {
@@ -28,36 +27,23 @@ async def update_github_secret(new_value):
     try:
         async with aiohttp.ClientSession(headers=headers) as session:
             # 1. 获取公钥
-            get_key_url = f"https://api.github.com/repos/{GH_REPO}/actions/secrets/public-key"
-            async with session.get(get_key_url) as resp:
-                if resp.status != 200:
-                    print(f"❌ 获取公钥失败: {resp.status}")
-                    return False
+            async with session.get(f"https://api.github.com/repos/{GH_REPO}/actions/secrets/public-key") as resp:
+                if resp.status != 200: return False
                 key_data = await resp.json()
                 public_key = key_data['key']
                 key_id = key_data['key_id']
 
-            # 2. 加密 Secret 值
-            def encrypt(pk_str: str, val_str: str) -> str:
-                pk = public.PublicKey(pk_str.encode("utf-8"), encoding.Base64Encoder)
-                sealed_box = public.SealedBox(pk)
-                encrypted = sealed_box.encrypt(val_str.encode("utf-8"))
-                return b64encode(encrypted).decode("utf-8")
-
-            encrypted_value = encrypt(public_key, new_value)
+            # 2. 加密逻辑
+            pk = public.PublicKey(public_key.encode("utf-8"), encoding.Base64Encoder)
+            sealed_box = public.SealedBox(pk)
+            encrypted_value = b64encode(sealed_box.encrypt(new_value.encode("utf-8"))).decode("utf-8")
 
             # 3. 提交更新
             put_url = f"https://api.github.com/repos/{GH_REPO}/actions/secrets/LOGIN_ACCOUNTS"
-            put_data = {"encrypted_value": encrypted_value, "key_id": key_id}
-            async with session.put(put_url, json=put_data) as resp:
-                if resp.status in [201, 204]:
-                    print("✅ GitHub Secret: LOGIN_ACCOUNTS 更新成功")
-                    return True
-                else:
-                    print(f"❌ Secret 更新失败，HTTP 状态码: {resp.status}")
-                    return False
+            async with session.put(put_url, json={"encrypted_value": encrypted_value, "key_id": key_id}) as resp:
+                return resp.status in [201, 204]
     except Exception as e:
-        print(f"❌ 更新 Secret 时发生异常: {e}")
+        print(f"❌ Secret 更新异常: {e}")
         return False
 
 async def tg_notify(message: str):
@@ -67,15 +53,10 @@ async def tg_notify(message: str):
     if token and chat_id:
         url = f"https://api.telegram.org/bot{token}/sendMessage"
         async with aiohttp.ClientSession() as session:
-            await session.post(url, json={
-                "chat_id": chat_id, 
-                "text": message, 
-                "parse_mode": "HTML",
-                "disable_web_page_preview": True
-            })
+            await session.post(url, json={"chat_id": chat_id, "text": message, "parse_mode": "HTML", "disable_web_page_preview": True})
 
 async def run_account(email, cookie_str):
-    """单个账号的监控与重启逻辑"""
+    """单个账号逻辑：验证 -> 提取新Cookie -> 检测状态 -> 重启"""
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
         "Cookie": cookie_str,
@@ -83,107 +64,103 @@ async def run_account(email, cookie_str):
         "X-Requested-With": "XMLHttpRequest"
     }
     
-    new_cookie_found = None
+    new_cookie_val = None
     async with aiohttp.ClientSession(headers=headers) as session:
-        # 1. 验证登录并提取新 Cookie
         try:
+            # 1. 登录验证 & 捕获 Set-Cookie
             async with session.get(f"{BASE_URL}/client/dashboard") as resp:
-                # 检查响应头中的 Set-Cookie
+                # 遍历所有 Set-Cookie 响应头
                 for c_name, c_obj in resp.cookies.items():
                     if c_name == "connect.sid":
-                        potential_new = f"connect.sid={c_obj.value}"
-                        if potential_new != cookie_str:
-                            new_cookie_found = potential_new
+                        captured = f"connect.sid={c_obj.value}"
+                        # 只有当新旧确实不同，且新 Cookie 包含关键的 s%3A 时才记录
+                        if captured != cookie_str and "s%3A" in captured:
+                            new_cookie_val = captured
                 
                 html = await resp.text()
                 if "logout" not in html:
-                    return {"email": email, "success": False, "reason": "Cookie 已失效", "new_cookie": None}
+                    return {"email": email, "success": False, "reason": "Cookie 失效", "new_cookie": None}
                 
-                # 提取所有服务器 ID
                 server_ids = list(set(re.findall(r'/servers/([a-f0-9]{8})', html)))
-        except Exception as e:
-            return {"email": email, "success": False, "reason": f"访问异常: {str(e)}", "new_cookie": None}
 
-        details = []
-        for sid in server_ids:
-            # 2. 获取服务器真实状态 (API 方式)
-            is_online = True
-            try:
-                async with session.get(f"{BASE_URL}/client/servers/{sid}/status") as s_resp:
-                    if s_resp.status == 200:
-                        data = await s_resp.json()
-                        status = str(data.get('status', data.get('state', ''))).lower()
-                        # 只有包含 run/on/start 才认为在线
-                        is_online = any(x in status for x in ['run', 'on', 'start'])
-                    else:
-                        # 备选方案：检查页面元素
-                        async with session.get(f"{BASE_URL}/client/servers/{sid}/console") as c_resp:
-                            c_html = await c_resp.text()
-                            is_online = "text-success" in c_html or "online" in c_html.lower()
-            except:
-                is_online = True # 报错时默认跳过，防止误重启
+            details = []
+            for sid in server_ids:
+                # 2. API 状态检测
+                is_online = True
+                try:
+                    async with session.get(f"{BASE_URL}/client/servers/{sid}/status") as s_resp:
+                        if s_resp.status == 200:
+                            data = await s_resp.json()
+                            status = str(data.get('status', data.get('state', ''))).lower()
+                            is_online = any(x in status for x in ['run', 'on', 'start'])
+                        else:
+                            async with session.get(f"{BASE_URL}/client/servers/{sid}/console") as c_resp:
+                                is_online = "text-success" in await c_resp.text()
+                except:
+                    is_online = True # 报错默认跳过
 
-            status_icon = "🟢 在线" if is_online else "🔴 离线"
-            
-            if not is_online:
-                # 3. 执行重启
-                async with session.get(f"{BASE_URL}/client/servers/{sid}/console") as c_resp:
-                    c_html = await c_resp.text()
-                    csrf = re.search(r'name="csrf-token"\s+content="([^"]+)"', c_html)
-                    csrf_token = csrf.group(1) if csrf else ""
+                status_icon = "🟢 在线" if is_online else "🔴 离线"
                 
-                post_headers = {**headers, "X-CSRF-TOKEN": csrf_token}
-                async with session.post(f"{BASE_URL}/client/api/server/restart", 
-                                        json={"serverId": sid}, headers=post_headers) as r_resp:
-                    res_text = "🔄 已重启" if r_resp.status == 200 else "❌ 重启请求失败"
-                    details.append(f"<code>{sid}</code>: {status_icon} -> {res_text}")
-            else:
-                details.append(f"<code>{sid}</code>: {status_icon} (跳过)")
-            
-            await asyncio.sleep(1) # 避免请求过快
+                if not is_online:
+                    # 3. 重启逻辑
+                    async with session.get(f"{BASE_URL}/client/servers/{sid}/console") as c_resp:
+                        csrf = re.search(r'name="csrf-token"\s+content="([^"]+)"', await c_resp.text())
+                        csrf_token = csrf.group(1) if csrf else ""
+                    
+                    post_h = {**headers, "X-CSRF-TOKEN": csrf_token}
+                    async with session.post(f"{BASE_URL}/client/api/server/restart", json={"serverId": sid}, headers=post_h) as r_resp:
+                        res_text = "🔄 已重启" if r_resp.status == 200 else "❌ 重启失败"
+                        details.append(f"<code>{sid}</code>: {status_icon} -> {res_text}")
+                else:
+                    details.append(f"<code>{sid}</code>: {status_icon} (跳过)")
+                await asyncio.sleep(1)
 
-        return {
-            "email": email, 
-            "success": True, 
-            "details": "\n".join(details) if details else "未发现服务器", 
-            "new_cookie": new_cookie_found
-        }
+            return {"email": email, "success": True, "details": "\n".join(details), "new_cookie": new_cookie_val}
+        except Exception as e:
+            return {"email": email, "success": False, "reason": f"运行出错: {str(e)}", "new_cookie": None}
 
 async def main():
-    if not ACCOUNTS_STR:
-        print("❌ 未在 Secret 中发现 LOGIN_ACCOUNTS 配置")
-        return
-
-    # 解析多账号格式：email1----cookie1,email2----cookie2
-    account_pairs = [a.split("----") for a in ACCOUNTS_STR.split(",") if "----" in a]
+    if not ACCOUNTS_STR: return
     
-    tasks = [run_account(acc[0], acc[1]) for acc in account_pairs]
-    results = await asyncio.gather(*tasks)
+    # 解析账号（处理多余空格和格式）
+    account_pairs = []
+    for entry in ACCOUNTS_STR.split(","):
+        if "----" in entry:
+            parts = entry.split("----")
+            account_pairs.append({"email": parts[0].strip(), "cookie": parts[1].strip()})
+    
+    results = await asyncio.gather(*[run_account(acc["email"], acc["cookie"]) for acc in account_pairs])
     
     report = [f"🖥 <b>Wispbyte 监控报告</b>\n{datetime.now().strftime('%m-%d %H:%M')}\n"]
-    new_config_list = []
+    new_config_entries = []
     any_updated = False
 
     for i, res in enumerate(results):
         icon = "✅" if res["success"] else "⚠️"
         report.append(f"{icon} <b>{res['email']}</b>\n{res.get('details', res.get('reason'))}")
         
-        # 即使运行失败，也保留旧 Cookie；运行成功且有新 Cookie，则更新
-        final_cookie = res["new_cookie"] if res["new_cookie"] else account_pairs[i][1]
-        new_config_list.append(f"{res['email']}----{final_cookie}")
+        # 格式化写回的 Cookie
+        old_val = account_pairs[i]["cookie"]
+        new_val = res["new_cookie"]
         
-        if res["new_cookie"]:
+        # 严格校验拼接，防止出现 connect.sid=connect.sid=
+        if res["success"] and new_val:
+            final_cookie = new_val if "connect.sid=" in new_val else f"connect.sid={new_val}"
             any_updated = True
-            print(f"✨ 账号 {res['email']} 捕获到新 Cookie")
+        else:
+            final_cookie = old_val
+            
+        new_config_entries.append(f"{res['email']}----{final_cookie}")
 
-    # 自动回写 GitHub Secret
+    # 自动回写流程
     if any_updated:
-        new_secret_val = ",".join(new_config_list)
-        success = await update_github_secret(new_secret_val)
+        new_secret_content = ",".join(new_config_entries)
+        success = await update_github_secret(new_secret_content)
         if success:
             report.append(f"\n🔄 <b>Cookie 已自动同步至 Secret</b>")
+            print("✅ GitHub Secret 自动同步完成")
         else:
-            report.append(f"\n⚠️ <b>Cookie 同步失败 (检查 GH_PAT 权限)</b>")
+            report.append(f"\n⚠️ <b>Cookie 同步失败 (请检查 PAT 权限)</b>")
 
     await tg_notify("\n".join(report))
 
